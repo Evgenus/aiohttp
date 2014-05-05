@@ -28,15 +28,15 @@ class HttpResponseTests(unittest.TestCase):
     def test_del(self):
         response = HttpResponse('get', 'http://python.org')
 
-        response._connection = unittest.mock.Mock()
+        response.connection = unittest.mock.Mock()
         close = response.close = unittest.mock.Mock()
         del response
         self.assertTrue(close.called)
 
     def test_close(self):
-        self.response._connection = self.connection
+        self.response.connection = self.connection
         self.response.close()
-        self.assertIsNone(self.response._connection)
+        self.assertIsNone(self.response.connection)
         self.assertTrue(self.connection.release.called)
         self.response.close()
         self.response.close()
@@ -66,6 +66,18 @@ class HttpResponseTests(unittest.TestCase):
         self.assertTrue(self.response.read.called)
         self.assertTrue(self.response.close.called)
 
+    def test_read_and_close_with_error(self):
+        self.response.read = unittest.mock.Mock()
+        self.response.read.return_value = asyncio.Future(loop=self.loop)
+        self.response.read.return_value.set_exception(ValueError)
+        self.response.close = unittest.mock.Mock()
+
+        self.assertRaises(
+            ValueError,
+            self.loop.run_until_complete, self.response.read_and_close())
+        self.assertTrue(self.response.read.called)
+        self.response.close.assert_called_with(True)
+
 
 class HttpRequestTests(unittest.TestCase):
 
@@ -81,6 +93,13 @@ class HttpRequestTests(unittest.TestCase):
 
     def tearDown(self):
         self.loop.close()
+
+    def test_del(self):
+        req = HttpRequest('get', 'http://python.org/')
+        writer = req._writer = unittest.mock.Mock()
+        del req
+
+        writer.cancel.assert_called_with()
 
     def test_method(self):
         req = HttpRequest('get', 'http://python.org/')
@@ -194,6 +213,9 @@ class HttpRequestTests(unittest.TestCase):
     def test_path_is_not_double_encoded(self):
         req = HttpRequest('get', "http://0.0.0.0/get/test case")
         self.assertEqual(req.path, "/get/test%20case")
+
+        req = HttpRequest('get', "http://0.0.0.0/get/test%2fcase")
+        self.assertEqual(req.path, "/get/test%2fcase")
 
         req = HttpRequest('get', "http://0.0.0.0/get/test%20case")
         self.assertEqual(req.path, "/get/test%20case")
@@ -396,7 +418,7 @@ class HttpRequestTests(unittest.TestCase):
         asyncio.async(exc(), loop=self.loop)
 
         resp = req.send(self.transport, self.protocol)
-        resp._connection = self.connection
+        resp.connection = self.connection
         self.loop.run_until_complete(req._writer)
         self.assertTrue(self.connection.close.called)
         self.assertTrue(self.protocol.set_exception.called)

@@ -111,7 +111,7 @@ class HttpClientFunctionalTests(unittest.TestCase):
             r.close()
 
     def test_HTTP_200_OK_METHOD_ssl(self):
-        connector = aiohttp.SocketConnector(verify_ssl=False, loop=self.loop)
+        connector = aiohttp.TCPConnector(verify_ssl=False, loop=self.loop)
 
         with test_utils.run_server(self.loop, use_ssl=True) as httpd:
             for meth in ('get', 'post', 'put', 'delete', 'head'):
@@ -151,7 +151,7 @@ class HttpClientFunctionalTests(unittest.TestCase):
             self.assertEqual(2, httpd['redirects'])
             r.close()
 
-    def _test_HTTP_302_REDIRECT_NON_HTTP(self):
+    def test_HTTP_302_REDIRECT_NON_HTTP(self):
         with test_utils.run_server(self.loop, router=Functional) as httpd:
             self.assertRaises(
                 ValueError,
@@ -469,7 +469,7 @@ class HttpClientFunctionalTests(unittest.TestCase):
             self.assertEqual(r.status, 200)
             r.close()
 
-    def _test_encoding(self):
+    def test_encoding(self):
         with test_utils.run_server(self.loop, router=Functional) as httpd:
             r = self.loop.run_until_complete(
                 client.request('get', httpd.url('encoding', 'deflate'),
@@ -555,7 +555,7 @@ class HttpClientFunctionalTests(unittest.TestCase):
 
     def test_keepalive(self):
         from aiohttp import connector
-        c = connector.SocketConnector(share_cookies=True, loop=self.loop)
+        c = connector.TCPConnector(share_cookies=True, loop=self.loop)
 
         with test_utils.run_server(self.loop, router=Functional) as httpd:
             r = self.loop.run_until_complete(
@@ -575,7 +575,7 @@ class HttpClientFunctionalTests(unittest.TestCase):
             r.close()
 
     def test_session_close(self):
-        conn = aiohttp.SocketConnector(loop=self.loop)
+        conn = aiohttp.TCPConnector(loop=self.loop)
 
         with test_utils.run_server(self.loop, router=Functional) as httpd:
             r = self.loop.run_until_complete(
@@ -597,7 +597,7 @@ class HttpClientFunctionalTests(unittest.TestCase):
 
     def test_session_cookies(self):
         from aiohttp import connector
-        conn = connector.SocketConnector(share_cookies=True, loop=self.loop)
+        conn = connector.TCPConnector(share_cookies=True, loop=self.loop)
 
         with test_utils.run_server(self.loop, router=Functional) as httpd:
             conn.update_cookies({'test': '1'})

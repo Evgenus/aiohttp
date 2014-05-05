@@ -1,4 +1,5 @@
-__all__ = ['BaseConnector', 'SocketConnector', 'UnixSocketConnector']
+__all__ = ['BaseConnector', 'TCPConnector', 'UnixConnector',
+           'SocketConnector', 'UnixSocketConnector']
 
 import asyncio
 import aiohttp
@@ -168,7 +169,7 @@ class BaseConnector(object):
         raise NotImplementedError()
 
 
-class SocketConnector(BaseConnector):
+class TCPConnector(BaseConnector):
 
     def __init__(self, *args, verify_ssl=True,
                  resolve=False, family=socket.AF_INET, **kwargs):
@@ -236,7 +237,7 @@ class SocketConnector(BaseConnector):
                     raise
 
 
-class UnixSocketConnector(BaseConnector):
+class UnixConnector(BaseConnector):
 
     def __init__(self, path, *args, **kw):
         super().__init__(*args, **kw)
@@ -247,3 +248,7 @@ class UnixSocketConnector(BaseConnector):
     def _create_connection(self, req, **kwargs):
         return (yield from self._loop.create_unix_connection(
             self._factory, self.path, **kwargs))
+
+
+SocketConnector = TCPConnector
+UnixSocketConnector = UnixConnector

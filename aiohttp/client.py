@@ -65,7 +65,7 @@ def request(method, url, *,
     :param chunked: Boolean or Integer. Set to chunk size for chunked
        transfer encoding.
     :param expect100: Boolean. Expect 100-continue response from server.
-    :param connector: aiohttp.conntect.SocketConnector instance to support
+    :param connector: aiohttp.conntect.BaseConnector instance to support
        connection pooling and session cookies.
     :param read_until_eof: Read response until eof if response
        does not have Content-Length header.
@@ -87,7 +87,7 @@ def request(method, url, *,
     if request_class is None:
         request_class = HttpRequest
     if connector is None:
-        connector = aiohttp.SocketConnector(loop=loop)
+        connector = aiohttp.TCPConnector(loop=loop)
 
     while True:
         req = request_class(
@@ -253,8 +253,6 @@ class HttpRequest:
         scheme, netloc, path, query, fragment = urllib.parse.urlsplit(self.url)
         if not path:
             path = '/'
-        else:
-            path = urllib.parse.unquote(path)
 
         if isinstance(params, dict):
             params = list(params.items())
@@ -273,7 +271,7 @@ class HttpRequest:
                 query = params
 
         self.path = urllib.parse.urlunsplit(
-            ('', '', urllib.parse.quote(path), query, fragment))
+            ('', '', urllib.parse.quote(path, safe='/%'), query, fragment))
 
     def update_headers(self, headers):
         """Update request headers."""
@@ -539,8 +537,8 @@ class HttpResponse(http.client.HTTPMessage):
     cookies = None  # Response cookies (Set-Cookie)
     content = None  # Payload stream
 
-    _reader = None   # input stream
-    _connection = None  # current connection
+    connection = None  # current connection
+    _reader = None     # input stream
     _response_parser = aiohttp.HttpResponseParser()
 
     def __init__(self, method, url, host='', *, writer=None, continue100=None):
@@ -554,7 +552,7 @@ class HttpResponse(http.client.HTTPMessage):
         self._continue = continue100
 
     def __del__(self):
-        if self._connection is not None:
+        if self.connection is not None:
             logging.warn('HttpResponse has to be closed explicitly! %s:%s:%s',
                          self.method, self.host, self.url)
             self.close(True)
@@ -574,7 +572,7 @@ class HttpResponse(http.client.HTTPMessage):
     def start(self, connection, read_until_eof=False):
         """Start response processing."""
         self._reader = connection.reader
-        self._connection = connection
+        self.connection = connection
 
         while True:
             httpstream = self._reader.set_parser(self._response_parser)
@@ -613,12 +611,12 @@ class HttpResponse(http.client.HTTPMessage):
         return self
 
     def close(self, force=False):
-        if self._connection is not None:
+        if self.connection is not None:
             if force:
-                self._connection.close()
+                self.connection.close()
             else:
-                self._connection.release()
-            self._connection = None
+                self.connection.release()
+            self.connection = None
         if (self._writer is not None) and not self._writer.done():
             self._writer.cancel()
             self._writer = None
@@ -669,9 +667,13 @@ class HttpResponse(http.client.HTTPMessage):
         """Read response payload and then close response."""
         try:
             payload = yield from self.read(decode)
-            return payload
-        finally:
+        except:
+            self.close(True)
+            raise
+        else:
             self.close()
+
+        return payload
 
 
 def str_to_bytes(s, encoding='utf-8'):
@@ -783,7 +785,7 @@ class HttpClient:
         self._loop = loop
 
         if conn_pool:
-            self._connector = aiohttp.SocketConnector(
+            self._connector = aiohttp.TCPConnector(
                 share_cookies=True, conn_timeout=conn_timeout,
                 resolve=resolve, verify_ssl=verify_ssl, loop=loop)
 
