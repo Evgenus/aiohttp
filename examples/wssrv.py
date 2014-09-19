@@ -38,11 +38,7 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
 
     @asyncio.coroutine
     def handle_request(self, message, payload):
-        upgrade = False
-        for hdr, val in message.headers:
-            if hdr == 'UPGRADE':
-                upgrade = 'websocket' in val.lower()
-                break
+        upgrade = 'websocket' in message.headers.get('UPGRADE', '').lower()
 
         if upgrade:
             # websocket handshake
@@ -68,8 +64,8 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
             while True:
                 try:
                     msg = yield from dataqueue.read()
-                except aiohttp.EofStream:
-                    # client droped connection
+                except:
+                    # client dropped connection
                     break
 
                 if msg.tp == websocket.MSG_PING:
@@ -167,8 +163,8 @@ class ChildProcess:
         while True:
             try:
                 msg = yield from reader.read()
-            except aiohttp.EofStream:
-                print('Superviser is dead, {} stopping...'.format(os.getpid()))
+            except:
+                print('Supervisor is dead, {} stopping...'.format(os.getpid()))
                 self.loop.stop()
                 break
 
@@ -240,7 +236,7 @@ class Worker:
         while True:
             try:
                 msg = yield from reader.read()
-            except aiohttp.EofStream:
+            except:
                 print('Restart unresponsive worker process: {}'.format(
                     self.pid))
                 self.kill()
@@ -285,7 +281,7 @@ class Worker:
         os.kill(self.pid, signal.SIGTERM)
 
 
-class Superviser:
+class Supervisor:
 
     def __init__(self, args):
         self.loop = asyncio.get_event_loop()
@@ -314,8 +310,8 @@ def main():
         args.host, port = args.host.split(':', 1)
         args.port = int(port)
 
-    superviser = Superviser(args)
-    superviser.start()
+    supervisor = Supervisor(args)
+    supervisor.start()
 
 
 if __name__ == '__main__':

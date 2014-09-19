@@ -1,8 +1,10 @@
 aiohttp package
 ===============
 
-The submodules ``clients``, ``errors``, ``parsers``, ``protocol`` and
-``session`` are exported into ``aiohttp``.
+All public names from submodules ``client``, ``connector``,
+``errors``, ``parsers``, ``protocol``, ``server``, ``utils``,
+``websocket``, ``worker`` and ``wsgi`` are exported into ``aiohttp``
+namespace.
 
 aiohttp.client module
 ---------------------
@@ -12,10 +14,26 @@ aiohttp.client module
     :undoc-members:
     :show-inheritance:
 
+aiohttp.connector module
+------------------------
+
+.. automodule:: aiohttp.connector
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 aiohttp.errors module
 ---------------------
 
 .. automodule:: aiohttp.errors
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+aiohttp.helpers module
+----------------------
+
+.. automodule:: aiohttp.helpers
     :members:
     :undoc-members:
     :show-inheritance:
@@ -44,26 +62,10 @@ aiohttp.server module
     :undoc-members:
     :show-inheritance:
 
-aiohttp.session module
+aiohttp.streams module
 ----------------------
 
-.. automodule:: aiohttp.session
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-aiohttp.test_utils module
--------------------------
-
-.. automodule:: aiohttp.test_utils
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-aiohttp.utils module
---------------------
-
-.. automodule:: aiohttp.utils
+.. automodule:: aiohttp.streams
     :members:
     :undoc-members:
     :show-inheritance:

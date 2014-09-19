@@ -3,26 +3,29 @@
 __all__ = ['request', 'HttpClient']
 
 import asyncio
-import base64
 import collections
-import email.message
-import http.client
 import http.cookies
 import json
 import io
 import inspect
-import itertools
-import logging
-import mimetypes
-import os
 import random
 import time
-import uuid
 import urllib.parse
 import weakref
 import warnings
+try:
+    import chardet
+except ImportError:  # pragma: no cover
+    chardet = None
 
 import aiohttp
+from . import helpers, streams
+from .log import client_log
+from .streams import EOF_MARKER, FlowControlStreamReader
+from .multidict import CaseInsensitiveMultiDict, MultiDict, MutableMultiDict
+
+HTTP_PORT = 80
+HTTPS_PORT = 443
 
 
 @asyncio.coroutine
@@ -36,42 +39,44 @@ def request(method, url, *,
             allow_redirects=True,
             max_redirects=10,
             encoding='utf-8',
-            version=(1, 1),
-            timeout=None,
+            version=aiohttp.HttpVersion11,
             compress=None,
             chunked=None,
             expect100=False,
             connector=None,
             loop=None,
             read_until_eof=True,
-            request_class=None):
+            request_class=None,
+            response_class=None):
     """Constructs and sends a request. Returns response object.
 
-    :param method: http method
-    :param url: request url
+    :param str method: http method
+    :param str url: request url
     :param params: (optional) Dictionary or bytes to be sent in the query
       string of the new request
     :param data: (optional) Dictionary, bytes, or file-like object to
       send in the body of the request
-    :param headers: (optional) Dictionary of HTTP Headers to send with
+    :param dict headers: (optional) Dictionary of HTTP Headers to send with
       the request
-    :param cookies: (optional) Dict object to send with the request
-    :param files: (optional) Dictionary of 'name': file-like-objects
-       for multipart encoding upload
-    :param auth: (optional) Auth tuple to enable Basic HTTP Auth
-    :param timeout: (optional) Float describing the timeout of the request
-    :param allow_redirects: (optional) Boolean. Set to True if POST/PUT/DELETE
+    :param dict cookies: (optional) Dict object to send with the request
+    :param auth: (optional) BasicAuth named tuple represent HTTP Basic Auth
+    :type auth: aiohttp.helpers.BasicAuth
+    :param bool allow_redirects: (optional) Set to True if POST/PUT/DELETE
        redirect following is allowed.
-    :param compress: Boolean. Set to True if request has to be compressed
+    :param version: Request http version.
+    :type version: aiohttp.protocol.HttpVersion
+    :param bool compress: Set to True if request has to be compressed
        with deflate encoding.
-    :param chunked: Boolean or Integer. Set to chunk size for chunked
-       transfer encoding.
-    :param expect100: Boolean. Expect 100-continue response from server.
-    :param connector: aiohttp.conntect.BaseConnector instance to support
+    :param chunked: Set to chunk size for chunked transfer encoding.
+    :type chunked: bool or int
+    :param bool expect100: Expect 100-continue response from server.
+    :param connector: BaseConnector sub-class instance to support
        connection pooling and session cookies.
-    :param read_until_eof: Read response until eof if response
+    :type connector: aiohttp.connector.BaseConnector
+    :param bool read_until_eof: Read response until eof if response
        does not have Content-Length header.
-    :param request_class: Custom Request class implementation.
+    :param request_class: (optional) Custom Request class implementation.
+    :param response_class: (optional) Custom Response class implementation.
     :param loop: Optional event loop.
 
     Usage::
@@ -79,41 +84,35 @@ def request(method, url, *,
       >>> import aiohttp
       >>> resp = yield from aiohttp.request('GET', 'http://python.org/')
       >>> resp
-      <HttpResponse(python.org/) [200]>
-      >>> data = yield from resp.read_and_close()
+      <ClientResponse(python.org/) [200]>
+      >>> data = yield from resp.read()
 
     """
     redirects = 0
     if loop is None:
         loop = asyncio.get_event_loop()
     if request_class is None:
-        request_class = HttpRequest
+        request_class = ClientRequest
     if connector is None:
-        connector = aiohttp.TCPConnector(loop=loop)
+        connector = aiohttp.TCPConnector(force_close=True, loop=loop)
 
     while True:
         req = request_class(
             method, url, params=params, headers=headers, data=data,
-            cookies=cookies, files=files, auth=auth, encoding=encoding,
-            version=version, compress=compress, chunked=chunked,
-            loop=loop, expect100=expect100)
+            cookies=cookies, files=files, encoding=encoding,
+            auth=auth, version=version, compress=compress, chunked=chunked,
+            loop=loop, expect100=expect100, response_class=response_class)
 
         try:
             conn = yield from connector.connect(req)
 
             resp = req.send(conn.writer, conn.reader)
             try:
-                if timeout:
-                    yield from asyncio.wait_for(
-                        resp.start(conn, read_until_eof), timeout, loop=loop)
-                else:
-                    yield from resp.start(conn, read_until_eof)
+                yield from resp.start(conn, read_until_eof)
             except:
                 resp.close()
                 conn.close()
                 raise
-        except asyncio.TimeoutError:
-            raise aiohttp.TimeoutError from None
         except aiohttp.BadStatusLine as exc:
             raise aiohttp.ClientConnectionError(exc)
         except OSError as exc:
@@ -123,20 +122,21 @@ def request(method, url, *,
         if resp.status in (301, 302) and allow_redirects:
             redirects += 1
             if max_redirects and redirects >= max_redirects:
-                resp.close()
+                resp.close(force=True)
                 break
 
-            r_url = resp.get('location') or resp.get('uri')
+            r_url = resp.headers.get('LOCATION') or resp.headers.get('URI')
 
             scheme = urllib.parse.urlsplit(r_url)[0]
             if scheme not in ('http', 'https', ''):
+                resp.close(force=True)
                 raise ValueError('Can redirect only to http or https')
             elif not scheme:
                 r_url = urllib.parse.urljoin(url, r_url)
 
             url = urllib.parse.urldefrag(r_url)[0]
             if url:
-                resp.close()
+                yield from asyncio.async(resp.release(), loop=loop)
                 continue
 
         break
@@ -144,20 +144,21 @@ def request(method, url, *,
     return resp
 
 
-class HttpRequest:
+class ClientRequest:
 
-    GET_METHODS = {'DELETE', 'GET', 'HEAD', 'OPTIONS'}
-    POST_METHODS = {'PATCH', 'POST', 'PUT', 'TRACE'}
+    GET_METHODS = {'GET', 'HEAD', 'OPTIONS'}
+    POST_METHODS = {'PATCH', 'POST', 'PUT', 'TRACE', 'DELETE'}
     ALL_METHODS = GET_METHODS.union(POST_METHODS)
 
     DEFAULT_HEADERS = {
-        'Accept': '*/*',
-        'Accept-Encoding': 'gzip, deflate',
+        'ACCEPT': '*/*',
+        'ACCEPT-ENCODING': 'gzip, deflate',
     }
 
     body = b''
     auth = None
     response = None
+    response_class = None
 
     _writer = None  # async task for streaming data
     _continue = None  # waiter future for '100 Continue' response
@@ -168,36 +169,42 @@ class HttpRequest:
     # doesn't produce request finalization.
     # After .write_bytes is done _writer has set to None and we have nothing
     # to cancel.
-    # Maybe we need to add .cancel() method to HttpRequest through for
+    # Maybe we need to add .cancel() method to ClientRequest through for
     # forced closing request sending.
 
     def __init__(self, method, url, *,
                  params=None, headers=None, data=None, cookies=None,
-                 files=None, auth=None, encoding='utf-8', version=(1, 1),
-                 compress=None, chunked=None, expect100=False,
-                 verify_ssl=True, loop=None):
+                 files=None, auth=None, encoding='utf-8',
+                 version=aiohttp.HttpVersion11, compress=None,
+                 chunked=None, expect100=False,
+                 loop=None, response_class=None):
         self.url = url
         self.method = method.upper()
         self.encoding = encoding
         self.chunked = chunked
         self.compress = compress
-        self.verify_ssl = verify_ssl
         self.loop = loop
+        self.response_class = response_class or ClientResponse
 
         self.update_version(version)
         self.update_host(url)
-        self.update_path(params, data)
+        self.update_path(params)
         self.update_headers(headers)
         self.update_cookies(cookies)
         self.update_content_encoding()
         self.update_auth(auth)
 
-        if data and not files:
-            if self.method not in self.GET_METHODS:
-                self.update_body_from_data(data)
-        elif files:
-            self.update_body_from_files(files, data)
+        if files:
+            warnings.warn(
+                'files parameter is deprecated. use data instead',
+                DeprecationWarning)
+            if data:
+                raise ValueError(
+                    'data and files parameters are '
+                    'not supported at the same time.')
+            data = files
 
+        self.update_body_from_data(data)
         self.update_transfer_encoding()
         self.update_expect_continue(expect100)
 
@@ -216,9 +223,10 @@ class HttpRequest:
         # basic auth info
         if '@' in netloc:
             authinfo, netloc = netloc.split('@', 1)
-            self.auth = authinfo.split(':', 1)
-            if len(self.auth) == 1:
-                self.auth.append('')
+            self.auth = helpers.BasicAuth(*authinfo.split(':', 1))
+
+        # Record entire netloc for usage in host header
+        self.netloc = netloc
 
         # extract host and port
         self.ssl = scheme == 'https'
@@ -231,10 +239,11 @@ class HttpRequest:
                     'Port number could not be converted.') from None
         else:
             if self.ssl:
-                self.port = http.client.HTTPS_PORT
+                self.port = HTTPS_PORT
             else:
-                self.port = http.client.HTTP_PORT
+                self.port = HTTP_PORT
 
+        self.scheme = scheme
         self.host = netloc
 
     def update_version(self, version):
@@ -252,7 +261,7 @@ class HttpRequest:
                     .format(version)) from None
         self.version = version
 
-    def update_path(self, params, data):
+    def update_path(self, params):
         """Build path."""
         # extract path
         scheme, netloc, path, query, fragment = urllib.parse.urlsplit(self.url)
@@ -261,12 +270,8 @@ class HttpRequest:
 
         if isinstance(params, dict):
             params = list(params.items())
-
-        # for GET request include data to query params
-        if data and self.method in self.GET_METHODS:
-            if isinstance(data, dict):
-                data = data.items()
-            params = list(itertools.chain(params or (), data))
+        elif isinstance(params, MultiDict):
+            params = list(params.items(getall=True))
 
         if params:
             params = urllib.parse.urlencode(params)
@@ -280,21 +285,23 @@ class HttpRequest:
 
     def update_headers(self, headers):
         """Update request headers."""
-        self.headers = email.message.Message()
+        self.headers = MutableMultiDict()
         if headers:
             if isinstance(headers, dict):
                 headers = headers.items()
+            elif isinstance(headers, MultiDict):
+                headers = headers.items(getall=True)
 
             for key, value in headers:
-                self.headers.add_header(key, value)
+                self.headers.add(key.upper(), value)
 
         for hdr, val in self.DEFAULT_HEADERS.items():
             if hdr not in self.headers:
                 self.headers[hdr] = val
 
         # add host
-        if 'host' not in self.headers:
-            self.headers['Host'] = self.host
+        if 'HOST' not in self.headers:
+            self.headers['HOST'] = self.netloc
 
     def update_cookies(self, cookies):
         """Update request cookies header."""
@@ -302,9 +309,9 @@ class HttpRequest:
             return
 
         c = http.cookies.SimpleCookie()
-        if 'cookie' in self.headers:
-            c.load(self.headers.get('cookie', ''))
-            del self.headers['cookie']
+        if 'COOKIE' in self.headers:
+            c.load(self.headers.get('COOKIE', ''))
+            del self.headers['COOKIE']
 
         if isinstance(cookies, dict):
             cookies = cookies.items()
@@ -316,118 +323,80 @@ class HttpRequest:
             else:
                 c[name] = value
 
-        self.headers['cookie'] = c.output(header='', sep=';').strip()
+        self.headers['COOKIE'] = c.output(header='', sep=';').strip()
 
     def update_content_encoding(self):
         """Set request content encoding."""
-        enc = self.headers.get('content-encoding', '').lower()
+        enc = self.headers.get('CONTENT-ENCODING', '').lower()
         if enc:
             self.compress = enc
             self.chunked = True  # enable chunked, no need to deal with length
         elif self.compress:
             if not isinstance(self.compress, str):
                 self.compress = 'deflate'
-            self.headers['content-encoding'] = self.compress
+            self.headers['CONTENT-ENCODING'] = self.compress
             self.chunked = True  # enable chunked, no need to deal with length
 
     def update_auth(self, auth):
         """Set basic auth."""
-        if not auth:
+        if auth is None:
             auth = self.auth
+        if auth is None:
+            return
 
-        if auth:
-            if isinstance(auth, (tuple, list)) and len(auth) == 2:
-                # basic auth
-                self.headers['Authorization'] = 'Basic %s' % (
-                    base64.b64encode(
-                        ('%s:%s' % (auth[0], auth[1])).encode('latin1'))
-                    .strip().decode('latin1'))
-            else:
-                raise ValueError("Only basic auth is supported")
+        if not isinstance(auth, helpers.BasicAuth):
+            warnings.warn(
+                'BasicAuth() tuple is required instead ', DeprecationWarning)
+            auth = helpers.BasicAuth(*auth)
+
+        self.headers['AUTHORIZATION'] = auth.encode()
 
     def update_body_from_data(self, data):
-        if (hasattr(data, '__iter__') and not isinstance(
-                data, (bytes, bytearray, str, list, dict))):
+        if not data:
+            return
+
+        if isinstance(data, str):
+            data = data.encode(self.encoding)
+
+        if isinstance(data, (bytes, bytearray)):
             self.body = data
-            if 'content-length' not in self.headers and self.chunked is None:
+            if 'CONTENT-TYPE' not in self.headers:
+                self.headers['CONTENT-TYPE'] = 'application/octet-stream'
+            if 'CONTENT-LENGTH' not in self.headers and not self.chunked:
+                self.headers['CONTENT-LENGTH'] = str(len(self.body))
+
+        elif isinstance(data, (asyncio.StreamReader, streams.DataQueue)):
+            self.body = data
+
+        elif inspect.isgenerator(data):
+            self.body = data
+            if 'CONTENT-LENGTH' not in self.headers and self.chunked is None:
                 self.chunked = True
+
         else:
-            if isinstance(data, (bytes, bytearray)):
-                self.body = data
-                if 'content-type' not in self.headers:
-                    self.headers['content-type'] = 'application/octet-stream'
+            if not isinstance(data, helpers.FormData):
+                data = helpers.FormData(data)
+
+            self.body = data(self.encoding)
+
+            if 'CONTENT-TYPE' not in self.headers:
+                self.headers['CONTENT-TYPE'] = data.contenttype
+
+            if data.is_form_data():
+                self.chunked = self.chunked or 8196
             else:
-                # form data (x-www-form-urlencoded)
-                if isinstance(data, dict):
-                    data = list(data.items())
-
-                if not isinstance(data, str):
-                    data = urllib.parse.urlencode(data, doseq=True)
-
-                self.body = data.encode(self.encoding)
-
-                if 'content-type' not in self.headers:
-                    self.headers['content-type'] = (
-                        'application/x-www-form-urlencoded')
-
-            if 'content-length' not in self.headers and not self.chunked:
-                self.headers['content-length'] = str(len(self.body))
-
-    def update_body_from_files(self, files, data):
-        """Generate multipart/form-data body."""
-        fields = []
-
-        if data:
-            if not isinstance(data, (list, dict)):
-                raise NotImplementedError(
-                    'Streamed body is not compatible with files.')
-
-            if isinstance(data, dict):
-                data = data.items()
-
-            for field, val in data:
-                fields.append((field, str_to_bytes(val)))
-
-        if isinstance(files, dict):
-            files = list(files.items())
-
-        for rec in files:
-            if not isinstance(rec, (tuple, list)):
-                rec = (rec,)
-
-            ft = None
-            if len(rec) == 1:
-                k = guess_filename(rec[0], 'unknown')
-                fields.append((k, k, rec[0]))
-
-            elif len(rec) == 2:
-                k, fp = rec
-                fn = guess_filename(fp, k)
-                fields.append((k, fn, fp))
-
-            else:
-                k, fp, ft = rec
-                fn = guess_filename(fp, k)
-                fields.append((k, fn, fp, ft))
-
-        self.chunked = self.chunked or 8192
-        boundary = uuid.uuid4().hex
-
-        self.body = encode_multipart_data(
-            fields, bytes(boundary, 'latin1'))
-
-        self.headers['content-type'] = (
-            'multipart/form-data; boundary=%s' % boundary)
+                if 'CONTENT-LENGTH' not in self.headers and not self.chunked:
+                    self.headers['CONTENT-LENGTH'] = str(len(self.body))
 
     def update_transfer_encoding(self):
         """Analyze transfer-encoding header."""
-        te = self.headers.get('transfer-encoding', '').lower()
+        te = self.headers.get('TRANSFER-ENCODING', '').lower()
 
         if self.chunked:
-            if 'content-length' in self.headers:
-                del self.headers['content-length']
+            if 'CONTENT-LENGTH' in self.headers:
+                del self.headers['CONTENT-LENGTH']
             if 'chunked' not in te:
-                self.headers['transfer-encoding'] = 'chunked'
+                self.headers['TRANSFER-ENCODING'] = 'chunked'
 
             self.chunked = self.chunked if type(self.chunked) is int else 8196
         else:
@@ -435,13 +404,13 @@ class HttpRequest:
                 self.chunked = 8196
             else:
                 self.chunked = None
-                if 'content-length' not in self.headers:
-                    self.headers['content-length'] = str(len(self.body))
+                if 'CONTENT-LENGTH' not in self.headers:
+                    self.headers['CONTENT-LENGTH'] = str(len(self.body))
 
     def update_expect_continue(self, expect=False):
         if expect:
-            self.headers['expect'] = '100-continue'
-        elif self.headers.get('expect', '').lower() == '100-continue':
+            self.headers['EXPECT'] = '100-continue'
+        elif self.headers.get('EXPECT', '').lower() == '100-continue':
             expect = True
 
         if expect:
@@ -488,16 +457,40 @@ class HttpRequest:
                         raise ValueError(
                             'Bytes object is expected, got: %s.' %
                             type(result))
+
+            elif isinstance(self.body, asyncio.StreamReader):
+                chunk = yield from self.body.read(streams.DEFAULT_LIMIT)
+                while chunk:
+                    yield from request.write(chunk)
+                    chunk = yield from self.body.read(streams.DEFAULT_LIMIT)
+
+            elif isinstance(self.body, streams.DataQueue):
+                while True:
+                    try:
+                        chunk = yield from self.body.read()
+                        if chunk is EOF_MARKER:
+                            break
+                        yield from request.write(chunk)
+                    except streams.EofStream:
+                        break
+
             else:
-                if isinstance(self.body, bytes):
+                if isinstance(self.body, (bytes, bytearray)):
                     self.body = (self.body,)
 
                 for chunk in self.body:
                     request.write(chunk)
         except Exception as exc:
-            reader.set_exception(exc)
+            reader.set_exception(
+                aiohttp.ClientConnectionError(
+                    'Can not write request body for %s' % self.url))
         else:
-            request.write_eof()
+            try:
+                request.write_eof()
+            except Exception as exc:
+                reader.set_exception(
+                    aiohttp.ClientConnectionError(
+                        'Can not write request body for %s' % self.url))
 
         self._writer = None
 
@@ -510,14 +503,17 @@ class HttpRequest:
         if self.chunked is not None:
             request.add_chunking_filter(self.chunked)
 
-        request.add_headers(*self.headers.items())
+        request.add_headers(
+            *((k, v)
+              for k, v in ((k, value)
+                           for k, value in self.headers.items(getall=True))))
         request.send_headers()
 
         self._writer = asyncio.async(
             self.write_bytes(request, reader), loop=self.loop)
 
-        self.response = HttpResponse(
-            self.method, self.path, self.host,
+        self.response = self.response_class(
+            self.method, self.url, self.host,
             writer=self._writer, continue100=self._continue)
         return self.response
 
@@ -530,7 +526,7 @@ class HttpRequest:
                 self._writer = None
 
 
-class HttpResponse(http.client.HTTPMessage):
+class ClientResponse:
 
     message = None  # RawResponseMessage object
 
@@ -543,6 +539,7 @@ class HttpResponse(http.client.HTTPMessage):
     content = None  # Payload stream
 
     connection = None  # current connection
+    flow_control_class = FlowControlStreamReader  # reader flow control
     _reader = None     # input stream
     _response_parser = aiohttp.HttpResponseParser()
     _connection_wr = None  # weakref to self for releasing connection on del
@@ -554,6 +551,7 @@ class HttpResponse(http.client.HTTPMessage):
         self.method = method
         self.url = url
         self.host = host
+        self.headers = None
         self._content = None
         self._writer = writer
         if writer is not None:
@@ -562,9 +560,9 @@ class HttpResponse(http.client.HTTPMessage):
 
     def __repr__(self):
         out = io.StringIO()
-        print('<HttpResponse({}{}) [{} {}]>'.format(
-            self.host, self.url, self.status, self.reason), file=out)
-        print(super().__str__(), file=out)
+        print('<ClientResponse({}) [{} {}]>'.format(
+            self.url, self.status, self.reason), file=out)
+        print(self.headers, file=out)
         return out.getvalue()
 
     __str__ = __repr__
@@ -575,8 +573,10 @@ class HttpResponse(http.client.HTTPMessage):
     def _setup_connection(self, connection):
         self._reader = connection.reader
         self.connection = connection
+        self.content = self.flow_control_class(
+            connection.reader, loop=connection.loop)
 
-        msg = ('HttpResponse has to be closed explicitly! {}:{}:{}'
+        msg = ('ClientResponse has to be closed explicitly! {}:{}:{}'
                .format(self.method, self.host, self.url))
 
         def _do_close_connection(wr, connection=connection, msg=msg):
@@ -608,26 +608,34 @@ class HttpResponse(http.client.HTTPMessage):
         self.reason = self.message.reason
 
         # headers
-        for hdr, val in self.message.headers:
-            self.add_header(hdr, val)
+        self.headers = CaseInsensitiveMultiDict(
+            self.message.headers.items(getall=True))
 
         # payload
-        self.content = self._reader.set_parser(
-            aiohttp.HttpPayloadParser(self.message, readall=read_until_eof))
+        response_with_body = self.method.lower() != 'head'
+        self._reader.set_parser(
+            aiohttp.HttpPayloadParser(self.message,
+                                      readall=read_until_eof,
+                                      response_with_body=response_with_body),
+            self.content)
 
         # cookies
         self.cookies = http.cookies.SimpleCookie()
-        if 'Set-Cookie' in self:
-            for hdr in self.get_all('Set-Cookie'):
+        if 'SET-COOKIE' in self.headers:
+            for hdr in self.headers.getall('SET-COOKIE'):
                 try:
                     self.cookies.load(hdr)
                 except http.cookies.CookieError as exc:
-                    logging.warn('Can not load response cookies: %s', exc)
-
+                    client_log.warning(
+                        'Can not load response cookies: %s', exc)
+            connection.share_cookies(self.cookies)
         return self
 
     def close(self, force=False):
         if self.connection is not None:
+            if self.content and not self.content.at_eof():
+                force = True
+
             if force:
                 self.connection.close()
             else:
@@ -638,6 +646,15 @@ class HttpResponse(http.client.HTTPMessage):
             self._writer.cancel()
             self._writer = None
             self._writer_wr = None
+
+    @asyncio.coroutine
+    def release(self):
+        try:
+            chunk = yield from self.content.readany()
+            while chunk is not EOF_MARKER or chunk:
+                chunk = yield from self.content.readany()
+        finally:
+            self.close()
 
     @asyncio.coroutine
     def wait_for_close(self):
@@ -651,121 +668,83 @@ class HttpResponse(http.client.HTTPMessage):
 
     @asyncio.coroutine
     def read(self, decode=False):
-        """Read response payload. Decode known types of content."""
+        """Read response payload."""
         if self._content is None:
-            buf = []
-            total = 0
             try:
-                while True:
-                    chunk = yield from self.content.read()
-                    size = len(chunk)
-                    buf.append((chunk, size))
-                    total += size
-            except aiohttp.EofStream:
-                pass
-
-            self._content = bytearray(total)
-
-            idx = 0
-            content = memoryview(self._content)
-            for chunk, size in buf:
-                content[idx:idx+size] = chunk
-                idx += size
+                self._content = yield from self.content.read()
+            except:
+                self.close(True)
+                raise
+            else:
+                self.close()
 
         data = self._content
 
         if decode:
-            ct = self.get('content-type', '').lower()
-            if ct == 'application/json':
-                data = json.loads(data.decode('utf-8'))
+            warnings.warn(
+                '.read(True) is deprecated. use .json() instead',
+                DeprecationWarning
+            )
+            return (yield from self.json())
 
         return data
 
     @asyncio.coroutine
     def read_and_close(self, decode=False):
         """Read response payload and then close response."""
-        try:
-            payload = yield from self.read(decode)
-        except:
-            self.close(True)
-            raise
-        else:
-            self.close()
+        warnings.warn(
+            'read_and_close is deprecated, use .read() instead',
+            DeprecationWarning
+        )
+        return (yield from self.read(decode))
 
-        return payload
+    def _get_encoding(self, encoding):
+        ctype = self.headers.get('CONTENT-TYPE', '').lower()
+        mtype, stype, _, params = helpers.parse_mimetype(ctype)
 
+        if not encoding:
+            encoding = params.get('charset')
+            if not encoding and chardet:
+                encoding = chardet.detect(self._content)['encoding']
+            if not encoding:  # pragma: no cover
+                encoding = 'utf-8'
 
-def str_to_bytes(s, encoding='utf-8'):
-    if isinstance(s, str):
-        return s.encode(encoding)
-    return s
+        return encoding
 
+    @asyncio.coroutine
+    def text(self, encoding=None):
+        """Read response payload and decode."""
+        if self._content is None:
+            yield from self.read()
 
-def guess_filename(obj, default=None):
-    name = getattr(obj, 'name', None)
-    if name and name[0] != '<' and name[-1] != '>':
-        return os.path.split(name)[-1]
-    return default
+        return self._content.decode(self._get_encoding(encoding))
 
+    @asyncio.coroutine
+    def json(self, *, encoding=None, loads=json.loads):
+        """Reads and decodes JSON response."""
+        if self._content is None:
+            yield from self.read()
 
-def encode_multipart_data(fields, boundary, encoding='utf-8', chunk_size=8196):
-    """
-    Encode a list of fields using the multipart/form-data MIME format.
+        ctype = self.headers.get('CONTENT-TYPE', '').lower()
+        if 'json' not in ctype:
+            client_log.warning(
+                'Attempt to decode JSON with unexpected mimetype: %s', ctype)
 
-    fields:
-        List of (name, value) or (name, filename, io) or
-        (name, filename, io, MIME type) field tuples.
-    """
-    for rec in fields:
-        yield b'--' + boundary + b'\r\n'
+        if not self._content.strip():
+            return None
 
-        field, *rec = rec
-
-        if len(rec) == 1:
-            data = rec[0]
-            yield (('Content-Disposition: form-data; name="%s"\r\n\r\n' %
-                    (field,)).encode(encoding))
-            yield data + b'\r\n'
-
-        else:
-            if len(rec) == 3:
-                fn, fp, ct = rec
-            else:
-                fn, fp = rec
-                ct = (mimetypes.guess_type(fn)[0] or
-                      'application/octet-stream')
-
-            yield ('Content-Disposition: form-data; name="%s"; '
-                   'filename="%s"\r\n' % (field, fn)).encode(encoding)
-            yield ('Content-Type: %s\r\n\r\n' % (ct,)).encode(encoding)
-
-            if isinstance(fp, str):
-                fp = fp.encode(encoding)
-
-            if isinstance(fp, bytes):
-                fp = io.BytesIO(fp)
-
-            while True:
-                chunk = fp.read(chunk_size)
-                if not chunk:
-                    break
-                yield str_to_bytes(chunk)
-
-            yield b'\r\n'
-
-    yield b'--' + boundary + b'--\r\n'
+        return loads(self._content.decode(self._get_encoding(encoding)))
 
 
 class HttpClient:
-    """Allow to use mutiple hosts with same path. And automatically
+    """Allow to use multiple hosts with same path. And automatically
     mark failed hosts.
     """
 
-    def __init__(self, hosts, *, method=None, path=None,
-                 ssl=False, timeout=None,
+    def __init__(self, hosts, *, method=None, path=None, ssl=False,
                  conn_pool=True, conn_timeout=None, failed_timeout=5.0,
-                 resolve=True, resolve_timeout=360.0, verify_ssl=True,
-                 loop=None):
+                 resolve=True, resolve_timeout=360.0, keepalive_timeout=30,
+                 verify_ssl=True, loop=None):
         super().__init__()
 
         if isinstance(hosts, str):
@@ -776,23 +755,25 @@ class HttpClient:
 
         self._hosts = []
         for host in hosts:
+            has_port = False
             if isinstance(host, str):
                 if ':' in host:
                     host, port = host.split(':')
                     try:
                         port = int(port)
+                        has_port = True
                     except:
                         raise ValueError('Port has to be integer: %s' % host)
                 else:
                     port = 80
             else:
+                has_port = True
                 host, port = host
 
-            self._hosts.append((host, port))
+            self._hosts.append((host, port, has_port))
 
         self._method = method
         self._path = path
-        self._timeout = timeout
         self._schema = 'https' if ssl else 'http'
 
         self._failed = collections.deque()
@@ -806,6 +787,7 @@ class HttpClient:
         if conn_pool:
             self._connector = aiohttp.TCPConnector(
                 share_cookies=True, conn_timeout=conn_timeout,
+                keepalive_timeout=keepalive_timeout,
                 resolve=resolve, verify_ssl=verify_ssl, loop=loop)
 
             self._resolve_timeout = resolve_timeout
@@ -847,9 +829,8 @@ class HttpClient:
                 allow_redirects=True,
                 max_redirects=10,
                 encoding='utf-8',
-                version=(1, 1),
+                version=aiohttp.HttpVersion11,
                 compress=None,
-                timeout=None,
                 chunked=None,
                 expect100=False,
                 read_until_eof=True):
@@ -858,21 +839,27 @@ class HttpClient:
             method = self._method
         if path is None:
             path = self._path
-        if timeout is None:
-            timeout = self._timeout
+
+        assert method is not None, 'request "method" is required.'
+        assert path is not None, 'request "path" is required.'
 
         # if all hosts marked as failed try first from failed
         if not self._hosts:
             self._hosts.append(self._failed.popleft()[0])
 
+        url = ''
         hosts = self._hosts
 
         while hosts:
             idx = random.randint(0, len(hosts)-1)
 
             info = hosts[idx]
-            url = urllib.parse.urljoin(
-                '{}://{}:{}'.format(self._schema, info[0], info[1]), path)
+            if info[2]:
+                url = urllib.parse.urljoin(
+                    '{}://{}:{}'.format(self._schema, info[0], info[1]), path)
+            else:
+                url = urllib.parse.urljoin(
+                    '{}://{}'.format(self._schema, info[0]), path)
 
             try:
                 resp = yield from request(
@@ -880,7 +867,7 @@ class HttpClient:
                     cookies=cookies, files=files, auth=auth,
                     encoding=encoding, allow_redirects=allow_redirects,
                     version=version, max_redirects=max_redirects,
-                    timeout=timeout, compress=compress, chunked=chunked,
+                    compress=compress, chunked=chunked,
                     expect100=expect100, read_until_eof=read_until_eof,
                     connector=self._connector, loop=self._loop)
             except (aiohttp.ConnectionError, aiohttp.TimeoutError):
@@ -902,4 +889,9 @@ class HttpClient:
                 if self._connector:
                     self._connector.clear_resolved_hosts(info[0], info[1])
 
-        raise aiohttp.ConnectionError('All hosts are unreachable.')
+        raise aiohttp.ConnectionError('All hosts are unreachable %s' % url)
+
+
+# backward compatibility
+HttpRequest = ClientRequest
+HttpResponse = ClientResponse

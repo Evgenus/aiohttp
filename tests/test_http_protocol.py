@@ -65,14 +65,41 @@ class HttpMessageTests(unittest.TestCase):
         self.assertEqual([], list(msg.headers))
 
         msg.add_header('content-type', 'plain/html')
-        self.assertEqual([('CONTENT-TYPE', 'plain/html')], list(msg.headers))
+        self.assertEqual(
+            [('CONTENT-TYPE', 'plain/html')], list(msg.headers.items()))
+
+    def test_add_header_with_spaces(self):
+        msg = protocol.Response(self.transport, 200)
+        self.assertEqual([], list(msg.headers))
+
+        msg.add_header('content-type', '  plain/html  ')
+        self.assertEqual(
+            [('CONTENT-TYPE', 'plain/html')], list(msg.headers.items()))
+
+    def test_add_header_non_ascii(self):
+        msg = protocol.Response(self.transport, 200)
+        self.assertEqual([], list(msg.headers))
+
+        with self.assertRaises(AssertionError):
+            msg.add_header('тип-контента', 'текст/плейн')
+
+    def test_add_header_invalid_value_type(self):
+        msg = protocol.Response(self.transport, 200)
+        self.assertEqual([], list(msg.headers))
+
+        with self.assertRaises(AssertionError):
+            msg.add_header('content-type', {'test': 'plain'})
+
+        with self.assertRaises(AssertionError):
+            msg.add_header(list('content-type'), 'text/plain')
 
     def test_add_headers(self):
         msg = protocol.Response(self.transport, 200)
         self.assertEqual([], list(msg.headers))
 
         msg.add_headers(('content-type', 'plain/html'))
-        self.assertEqual([('CONTENT-TYPE', 'plain/html')], list(msg.headers))
+        self.assertEqual(
+            [('CONTENT-TYPE', 'plain/html')], list(msg.headers.items()))
 
     def test_add_headers_length(self):
         msg = protocol.Response(self.transport, 200)
@@ -95,7 +122,8 @@ class HttpMessageTests(unittest.TestCase):
         self.assertEqual([], list(msg.headers))
 
         msg.add_headers(('upgrade', 'websocket'))
-        self.assertEqual([('UPGRADE', 'websocket')], list(msg.headers))
+        self.assertEqual(
+            [('UPGRADE', 'websocket')], list(msg.headers.items()))
 
     def test_add_headers_connection_keepalive(self):
         msg = protocol.Response(self.transport, 200)
@@ -117,7 +145,7 @@ class HttpMessageTests(unittest.TestCase):
         msg = protocol.Response(self.transport, 200)
         msg._add_default_headers()
 
-        headers = [r for r, _ in msg.headers]
+        headers = [r for r, _ in msg.headers.items()]
         self.assertIn('DATE', headers)
         self.assertIn('CONNECTION', headers)
 
@@ -125,23 +153,21 @@ class HttpMessageTests(unittest.TestCase):
         msg = protocol.Response(self.transport, 200)
         msg._add_default_headers()
 
-        headers = [r for r, _ in msg.headers]
-        self.assertIn('SERVER', headers)
+        self.assertIn('SERVER', msg.headers)
 
     def test_default_headers_useragent(self):
         msg = protocol.Request(self.transport, 'GET', '/')
         msg._add_default_headers()
 
-        headers = [r for r, _ in msg.headers]
-        self.assertNotIn('SERVER', headers)
-        self.assertIn('USER-AGENT', headers)
+        self.assertNotIn('SERVER', msg.headers)
+        self.assertIn('USER-AGENT', msg.headers)
 
     def test_default_headers_useragent_custom(self):
         msg = protocol.Request(self.transport, 'GET', '/')
         msg.add_headers(('user-agent', 'my custom agent'))
         msg._add_default_headers()
 
-        headers = [r for r, _ in msg.headers
+        headers = [r for r, _ in msg.headers.items()
                    if r.lower() == 'user-agent']
         self.assertEqual(len(headers), 1)
 
@@ -149,14 +175,14 @@ class HttpMessageTests(unittest.TestCase):
         msg = protocol.Response(self.transport, 200)
         msg._add_default_headers()
 
-        headers = [r for r, _ in msg.headers]
+        headers = [r for r, _ in msg.headers.items()]
         self.assertNotIn('TRANSFER-ENCODING', headers)
 
         msg = protocol.Response(self.transport, 200)
         msg.force_chunked()
         msg._add_default_headers()
 
-        headers = [r for r, _ in msg.headers]
+        headers = [r for r, _ in msg.headers.items()]
         self.assertIn('TRANSFER-ENCODING', headers)
 
     def test_default_headers_connection_upgrade(self):
@@ -164,7 +190,7 @@ class HttpMessageTests(unittest.TestCase):
         msg.upgrade = True
         msg._add_default_headers()
 
-        headers = [r for r in msg.headers if r[0] == 'CONNECTION']
+        headers = [r for r in msg.headers.items() if r[0] == 'CONNECTION']
         self.assertEqual([('CONNECTION', 'upgrade')], headers)
 
     def test_default_headers_connection_close(self):
@@ -172,7 +198,7 @@ class HttpMessageTests(unittest.TestCase):
         msg.force_close()
         msg._add_default_headers()
 
-        headers = [r for r in msg.headers if r[0] == 'CONNECTION']
+        headers = [r for r in msg.headers.items() if r[0] == 'CONNECTION']
         self.assertEqual([('CONNECTION', 'close')], headers)
 
     def test_default_headers_connection_keep_alive(self):
@@ -180,7 +206,7 @@ class HttpMessageTests(unittest.TestCase):
         msg.keepalive = True
         msg._add_default_headers()
 
-        headers = [r for r in msg.headers if r[0] == 'CONNECTION']
+        headers = [r for r in msg.headers.items() if r[0] == 'CONNECTION']
         self.assertEqual([('CONNECTION', 'keep-alive')], headers)
 
     def test_send_headers(self):
@@ -196,6 +222,25 @@ class HttpMessageTests(unittest.TestCase):
 
         self.assertTrue(content.startswith(b'HTTP/1.1 200 OK\r\n'))
         self.assertIn(b'CONTENT-TYPE: plain/html', content)
+        self.assertTrue(msg.headers_sent)
+        self.assertTrue(msg.is_headers_sent())
+        # cleanup
+        msg.writer.close()
+
+    def test_send_headers_non_ascii(self):
+        write = self.transport.write = unittest.mock.Mock()
+
+        msg = protocol.Response(self.transport, 200)
+        msg.add_headers(('x-header', 'текст'))
+        self.assertFalse(msg.is_headers_sent())
+
+        msg.send_headers()
+
+        content = b''.join([arg[1][0] for arg in list(write.mock_calls)])
+
+        self.assertTrue(content.startswith(b'HTTP/1.1 200 OK\r\n'))
+        self.assertIn(b'X-HEADER: \xd1\x82\xd0\xb5\xd0\xba\xd1\x81\xd1\x82',
+                      content)
         self.assertTrue(msg.headers_sent)
         self.assertTrue(msg.is_headers_sent())
         # cleanup

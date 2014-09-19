@@ -71,7 +71,7 @@ class WSGIServerHttpProtocol(server.ServerHttpProtocol):
         script_name = self.SCRIPT_NAME
         server = forward
 
-        for hdr_name, hdr_value in message.headers:
+        for hdr_name, hdr_value in message.headers.items(getall=True):
             if hdr_name == 'HOST':
                 server = hdr_value
             elif hdr_name == 'SCRIPT_NAME':
@@ -143,11 +143,7 @@ class WSGIServerHttpProtocol(server.ServerHttpProtocol):
 
         if self.readpayload:
             wsgiinput = io.BytesIO()
-            try:
-                while True:
-                    wsgiinput.write((yield from payload.read()))
-            except aiohttp.EofStream:
-                pass
+            wsgiinput.write((yield from payload.read()))
             wsgiinput.seek(0)
             payload = wsgiinput
 

@@ -12,7 +12,7 @@ build:
 	$(PYTHON) ./setup.py develop
 
 venv:
-	curl -O https://raw.github.com/pypa/virtualenv/1.10.X/virtualenv.py
+	curl -O https://raw.githubusercontent.com/pypa/virtualenv/1.10.X/virtualenv.py
 	python3.3 virtualenv.py venv
 	rm -f ./virtualenv.py
 	curl -O https://bitbucket.org/pypa/setuptools/raw/bootstrap/ez_setup.py
@@ -56,5 +56,8 @@ clean:
 	rm -rf coverage
 	rm -rf build
 
+doc:
+	cd docs && make html
+	echo "open file://`pwd`/docs/_build/html/index.html"
 
-.PHONY: all build venv flake test vtest testloop cov clean
+.PHONY: all build venv flake test vtest testloop cov clean doc

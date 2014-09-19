@@ -18,8 +18,8 @@ import urllib.parse
 
 import asyncio
 import aiohttp
-from aiohttp import client
 from aiohttp import server
+from aiohttp import helpers
 
 
 def run_briefly(loop):
@@ -74,21 +74,16 @@ def run_server(loop, *, listen_addr=('127.0.0.1', 0),
             if properties.get('noresponse', False):
                 yield from asyncio.sleep(99999)
 
-            for hdr, val in message.headers:
+            for hdr, val in message.headers.items(getall=True):
                 if (hdr == 'EXPECT') and (val == '100-continue'):
                     self.transport.write(b'HTTP/1.0 100 Continue\r\n\r\n')
                     break
 
             if router is not None:
-                body = bytearray()
-                try:
-                    while True:
-                        body.extend((yield from payload.read()))
-                except aiohttp.EofStream:
-                    pass
+                body = yield from payload.read()
 
                 rob = router(
-                    self, properties, self.transport, message, bytes(body))
+                    self, properties, self.transport, message, body)
                 rob.dispatch()
 
             else:
@@ -140,7 +135,7 @@ def run_server(loop, *, listen_addr=('127.0.0.1', 0),
             # call pending connection_made if present
             run_briefly(thread_loop)
 
-            # close opened trnsports
+            # close opened transports
             for tr in transports:
                 tr.close()
 
@@ -171,7 +166,7 @@ class Router:
     def __init__(self, srv, props, transport, message, payload):
         # headers
         self._headers = http.client.HTTPMessage()
-        for hdr, val in message.headers:
+        for hdr, val in message.headers.items(getall=True):
             self._headers.add_header(hdr, val)
 
         self._srv = srv
@@ -243,6 +238,8 @@ class Router:
         }
         if body:  # pragma: no cover
             resp['content'] = body
+        else:
+            resp['content'] = self._body.decode('utf-8')
 
         ct = self._headers.get('content-type', '').lower()
 
@@ -265,7 +262,7 @@ class Router:
             if message.is_multipart():
                 for msg in message.get_payload():
                     if msg.is_multipart():
-                        logging.warn('multipart msg is not expected')
+                        logging.warning('multipart msg is not expected')
                     else:
                         key, params = cgi.parse_header(
                             msg.get('content-disposition', ''))
@@ -301,7 +298,7 @@ class Router:
             except:
                 return
         else:
-            response.write(client.str_to_bytes(body))
+            response.write(helpers.str_to_bytes(body))
 
         response.write_eof()
 

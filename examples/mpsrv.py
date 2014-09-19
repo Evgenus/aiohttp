@@ -2,7 +2,6 @@
 """Simple multiprocess http server written using an event loop."""
 
 import argparse
-import email.message
 import os
 import socket
 import signal
@@ -46,10 +45,6 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         if not path:
             raise aiohttp.HttpErrorException(404)
 
-        headers = email.message.Message()
-        for hdr, val in message.headers:
-            headers.add_header(hdr, val)
-
         if isdir and not path.endswith('/'):
             path = path + '/'
             raise aiohttp.HttpErrorException(
@@ -60,7 +55,7 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
         response.add_header('Transfer-Encoding', 'chunked')
 
         # content encoding
-        accept_encoding = headers.get('accept-encoding', '').lower()
+        accept_encoding = message.headers.get('accept-encoding', '').lower()
         if 'deflate' in accept_encoding:
             response.add_header('Content-Encoding', 'deflate')
             response.add_compression_filter('deflate')
@@ -153,8 +148,8 @@ class ChildProcess:
         while True:
             try:
                 msg = yield from reader.read()
-            except aiohttp.EofStream:
-                print('Superviser is dead, {} stopping...'.format(os.getpid()))
+            except:
+                print('Supervisor is dead, {} stopping...'.format(os.getpid()))
                 self.loop.stop()
                 break
 
@@ -222,7 +217,7 @@ class Worker:
         while True:
             try:
                 msg = yield from reader.read()
-            except aiohttp.EofStream:
+            except:
                 print('Restart unresponsive worker process: {}'.format(
                     self.pid))
                 self.kill()
@@ -261,7 +256,7 @@ class Worker:
         os.kill(self.pid, signal.SIGTERM)
 
 
-class Superviser:
+class Supervisor:
 
     def __init__(self, args):
         self.loop = asyncio.get_event_loop()
@@ -290,8 +285,8 @@ def main():
         args.host, port = args.host.split(':', 1)
         args.port = int(port)
 
-    superviser = Superviser(args)
-    superviser.start()
+    supervisor = Supervisor(args)
+    supervisor.start()
 
 
 if __name__ == '__main__':
